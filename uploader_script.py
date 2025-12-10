@@ -4,7 +4,9 @@ import argparse
 import time
 import asyncio
 from telethon import TelegramClient
-from telethon.tl.types import MessageMediaDocument, MessageMediaVideo
+# FIX: 'MessageMediaVideo' is no longer available in newer Telethon versions.
+# We now rely only on MessageMediaDocument, which typically encapsulates videos too.
+from telethon.tl.types import MessageMediaDocument
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -157,7 +159,8 @@ async def download_video_and_upload(link):
         print(f"Fetching message {message_id} from chat {channel_id}...")
         message = await client.get_messages(channel_id, ids=message_id)
 
-        if not message or not (message.media and isinstance(message.media, (MessageMediaVideo, MessageMediaDocument))):
+        # Updated check: MessageMediaVideo is removed, relying on MessageMediaDocument to cover videos.
+        if not message or not (message.media and isinstance(message.media, MessageMediaDocument)):
             print("🔴 Error: Message is missing or does not contain a supported media file (video/document).")
             return
 
