@@ -1,1 +1,10 @@
 
+Telegram API Library (Telethon is used for user accounts)
+
+telethon
+
+Google/YouTube API Libraries
+
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
