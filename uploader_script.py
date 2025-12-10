@@ -4,6 +4,8 @@ import argparse
 import time
 import asyncio
 from telethon import TelegramClient, errors
+# FIX: Import StringSession to enforce in-memory session storage for CI/CD environments
+from telethon.sessions import StringSession 
 from telethon.tl.types import MessageMediaDocument
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -178,8 +180,12 @@ async def download_video_and_upload(link):
     try:
         # 4. Connect to Telegram
         print("Connecting to Telegram...")
-        # Use the session string for non-interactive login
-        client = TelegramClient(TG_SESSION_STRING, TG_API_ID, TG_API_HASH)
+        
+        # FIX: Explicitly use StringSession to prevent Telethon from trying 
+        # to open/write a local .session file, which fails in restrictive CI/CD environments.
+        session = StringSession(TG_SESSION_STRING)
+        client = TelegramClient(session, TG_API_ID, TG_API_HASH)
+        
         await client.start()
         print("Connection successful.")
 
