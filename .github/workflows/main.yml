@@ -1,28 +1,23 @@
-name: Run Telegram to YouTube Uploader
+name: Run Telegram to YouTube Batch Uploader
 
 on:
-  # Allows manual running of the workflow via the GitHub Actions UI
   workflow_dispatch:
     inputs:
-      telegram_link:
-        description: 'Full Telegram message link (e.g., https://t.me/c/ID/MSG_ID)'
+      telegram_links:
+        description: 'Comma-separated Telegram links (e.g., https://t.me/c/1/10, https://t.me/c/1/11)'
         required: true
-        type: string
-      video_title:
-        description: 'Optional Title for the YouTube Video'
-        required: false
         type: string
       
 jobs:
   upload:
     runs-on: ubuntu-latest
+    # Added a timeout of 3 hours just in case you provide many large files
+    timeout-minutes: 180 
     
-    # Set environment variables using the GitHub Secrets
     env:
       TG_API_ID: ${{ secrets.TG_API_ID }}
       TG_API_HASH: ${{ secrets.TG_API_HASH }}
       TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
-
       YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
       YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
       YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
@@ -34,11 +29,11 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10' # Use a stable Python version
+          python-version: '3.10'
 
       - name: Install dependencies
         run: pip install -r requirements.txt
         
       - name: Run Uploader Script
-        run: python uploader_script.py "${{ github.event.inputs.telegram_link }}"
-        # Pass the user's input (the Telegram link) directly to the Python script as an argument.
+        # We pass the entire input string to the script
+        run: python uploader_script.py "${{ github.event.inputs.telegram_links }}"
