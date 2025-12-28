@@ -20,11 +20,10 @@ import googleapiclient.errors
 # --- CONFIGURATION ---
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
 GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
-# Changed to the preview model that usually works on free tiers
-IMAGE_GEN_MODEL = "gemini-2.5-flash-image-preview"
 
-# Fetching the API Key
+# Fetching API Keys
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '').strip()
+OMDB_API_KEY = os.environ.get('OMDB_API_KEY', '').strip() # Added for IMDb info
 
 def run_command(command):
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
@@ -34,106 +33,93 @@ def run_command(command):
 def download_progress_callback(current, total):
     print(f"⏳ Telegram Download: {current/1024/1024:.2f}MB / {total/1024/1024:.2f}MB ({current*100/total:.2f}%)", end='\r', flush=True)
 
-def clean_fallback_title(filename):
+def clean_search_term(filename):
+    """Extracts a clean movie/series title for searching."""
     name = os.path.splitext(filename)[0]
     name = re.sub(r'(_|\.|\-)', ' ', name)
+    # Remove technical tags
     tags = [
         r'\d{3,4}p', 'HD', 'NF', 'WEB-DL', 'Dual Audio', 'ES', 'x264', 'x265', 
-        'HEVC', 'BluRay', 'HDRip', 'AAC', '5.1', '10bit'
+        'HEVC', 'BluRay', 'HDRip', 'AAC', '5.1', '10bit', r'\[.*?\]', r'\(.*?\)'
     ]
     for tag in tags:
         name = re.sub(tag, '', name, flags=re.IGNORECASE)
+    # Remove extra spaces
     return ' '.join(name.split()).strip()
 
-# --- AI METADATA ---
-async def get_ai_metadata(filename):
-    print(f"🤖 Calling Gemini AI for metadata: {filename}")
+# --- METADATA (OMDb + Gemini) ---
+async def get_metadata(filename):
+    search_term = clean_search_term(filename)
+    print(f"🔍 Searching IMDb (via OMDb) for: {search_term}")
     
-    if not GEMINI_API_KEY:
-        print(f"⚠️ GEMINI_API_KEY is EMPTY!")
-        title = clean_fallback_title(filename)
-        return {"title": title, "description": f"Series: {title}", "image_prompt": title}
-    
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    
-    prompt = (
-        f"You are a professional YouTube SEO manager. Analyze this file: '{filename}'\n"
-        "1. CLEAN TITLE: Return ONLY the formal title (e.g., 'Love, Death & Robots - S04E09'). "
-        "Remove ALL technical tags like WEB-DL, 720p, Dual Audio, etc.\n"
-        "2. DESCRIPTION: Write 3 paragraphs of cinematic description. Use search tools for plot/cast. No links.\n"
-        "3. IMAGE PROMPT: A descriptive artistic prompt for a cinematic poster (no text).\n"
-        "Return ONLY JSON."
-    )
-    
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "tools": [{"google_search": {}}],
-        "generationConfig": {"responseMimeType": "application/json"}
-    }
-    
-    try:
-        res = requests.post(url, json=payload, timeout=45)
-        if res.status_code == 200:
+    omdb_data = None
+    if OMDB_API_KEY:
+        try:
+            res = requests.get(f"http://www.omdbapi.com/?t={search_term}&apikey={OMDB_API_KEY}", timeout=10)
             data = res.json()
-            raw_text = data.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '{}')
-            meta = json.loads(raw_text)
-            if 'title' in meta:
-                print(f"✅ AI metadata generated: {meta['title']}")
-                return meta
-    except Exception as e:
-        print(f"⚠️ AI Metadata failed: {e}")
-    
-    title = clean_fallback_title(filename)
-    return {"title": title, "description": f"Quality upload of {title}.", "image_prompt": title}
+            if data.get("Response") == "True":
+                print(f"✅ IMDb Match Found: {data['Title']}")
+                omdb_data = data
+        except Exception as e:
+            print(f"⚠️ OMDb Search failed: {e}")
 
-async def generate_thumbnail(image_prompt):
-    if not GEMINI_API_KEY: return None
-    print(f"🎨 Generating AI Thumbnail (Flash Image Mode)...")
-    
-    # Using the Flash Image Preview which is generally accessible to free tier users
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{IMAGE_GEN_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    
-    payload = {
-        "contents": [{
-            "parts": [{
-                "text": f"Generate a high-quality cinematic movie poster, digital art, high detail, masterpiece, NO TEXT: {image_prompt}"
-            }]
-        }],
-        "generationConfig": {
-            "responseModalities": ["IMAGE"]
-        }
-    }
-    
-    try:
-        res = requests.post(url, json=payload, timeout=90)
-        if res.status_code == 200:
-            data = res.json()
-            # Find the part that contains inlineData (the image)
-            parts = data.get('candidates', [{}])[0].get('content', {}).get('parts', [])
-            img_data = None
-            for p in parts:
-                if 'inlineData' in p:
-                    img_data = p['inlineData']['data']
-                    break
-            
-            if img_data:
-                with open("thumbnail.png", "wb") as f:
-                    f.write(base64.b64decode(img_data))
-                print("✅ Thumbnail generated successfully via Flash Image.")
-                return "thumbnail.png"
-            else:
-                print(f"⚠️ No image data found in response: {res.text[:200]}")
+    # Use Gemini to polish the data or generate it if OMDb failed
+    if GEMINI_API_KEY:
+        print("🤖 Using Gemini to finalize neat description...")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        
+        # Build prompt based on whether we have OMDb data
+        if omdb_data:
+            prompt = (
+                f"I found this movie on IMDb: {json.dumps(omdb_data)}\n"
+                "Format this into a professional YouTube metadata set.\n"
+                "1. TITLE: Neatly formatted (e.g. 'Movie Name (Year)')\n"
+                "2. DESCRIPTION: Include a synopsis, Director, Cast, and a 'Thanks for watching' note.\n"
+                "Return as JSON with keys 'title' and 'description'."
+            )
         else:
-            print(f"⚠️ Image API Error ({res.status_code}): {res.text[:200]}")
-                    
-    except Exception as e:
-        print(f"⚠️ Thumbnail generation failed: {e}")
-    return None
+            prompt = (
+                f"Analyze filename: '{filename}'. Guess the movie/show.\n"
+                "1. TITLE: Clean title (e.g. 'Show Name - S01E01')\n"
+                "2. DESCRIPTION: Cinematic overview paragraphs.\n"
+                "Return as JSON."
+            )
+
+        try:
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"responseMimeType": "application/json"}
+            }
+            res = requests.post(url, json=payload, timeout=30)
+            if res.status_code == 200:
+                meta = json.loads(res.json()['candidates'][0]['content']['parts'][0]['text'])
+                return meta
+        except:
+            pass
+
+    # Fallback if both fail
+    title = omdb_data['Title'] if omdb_data else search_term
+    desc = omdb_data['Plot'] if omdb_data else f"Upload: {search_term}"
+    return {"title": title, "description": desc}
+
+# --- FREE THUMBNAIL METHOD ---
+def generate_thumbnail_from_video(video_path):
+    print("🖼️ Extracting thumbnail from video frame...")
+    output_thumb = "thumbnail.jpg"
+    try:
+        duration_cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 '{video_path}'"
+        duration_out, _, _ = run_command(duration_cmd)
+        seek_time = float(duration_out.strip()) / 3 if duration_out.strip() else 10
+        extract_cmd = f"ffmpeg -ss {seek_time} -i '{video_path}' -vframes 1 -q:v 2 -y {output_thumb}"
+        run_command(extract_cmd)
+        return output_thumb if os.path.exists(output_thumb) else None
+    except: return None
 
 # --- VIDEO PROCESSING ---
 def process_video(input_path):
     output_path = "processed_video.mp4"
-    print(f"\n🔍 Extracting English audio track...")
+    print(f"\n🔍 Processing audio tracks...")
+    # Map video and keep English audio or first track
     cmd_ffmpeg = (
         f"ffmpeg -i '{input_path}' "
         f"-map 0:v:0 -map 0:a:m:language:eng? -map 0:a:0? "
@@ -146,8 +132,7 @@ def process_video(input_path):
 def upload_to_youtube(video_path, metadata, thumb_path):
     try:
         creds = Credentials(
-            token=None,
-            refresh_token=os.environ.get('YOUTUBE_REFRESH_TOKEN'),
+            token=None, refresh_token=os.environ.get('YOUTUBE_REFRESH_TOKEN'),
             token_uri='https://oauth2.googleapis.com/token',
             client_id=os.environ.get('YOUTUBE_CLIENT_ID'),
             client_secret=os.environ.get('YOUTUBE_CLIENT_SECRET'),
@@ -165,7 +150,7 @@ def upload_to_youtube(video_path, metadata, thumb_path):
             'status': {'privacyStatus': 'private'}
         }
         
-        print(f"🚀 Uploading to YouTube: {body['snippet']['title']}")
+        print(f"🚀 Uploading: {body['snippet']['title']}")
         media = MediaFileUpload(video_path, chunksize=1024*1024, resumable=True)
         request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
         
@@ -175,19 +160,13 @@ def upload_to_youtube(video_path, metadata, thumb_path):
             if status: print(f"Uploaded {int(status.progress() * 100)}%")
 
         video_id = response['id']
-        
-        if thumb_path and os.path.exists(thumb_path):
-            print(f"🖼️ Applying thumbnail to video {video_id}...")
-            # Wait for video to be indexed
-            time.sleep(12)
+        if thumb_path:
+            time.sleep(5)
             try:
                 youtube.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(thumb_path)).execute()
-                print("✅ Thumbnail applied!")
-            except Exception as te:
-                print(f"⚠️ Thumbnail application failed: {te}")
+            except: pass
             
-        print(f"🎉 SUCCESS! https://youtu.be/{video_id}")
-        
+        print(f"🎉 DONE: https://youtu.be/{video_id}")
     except Exception as e:
         print(f"🔴 YouTube Error: {e}")
 
@@ -206,25 +185,18 @@ async def run_flow(link):
     if not message or not message.media: return
 
     raw_file = f"download_{msg_id}" + (message.file.ext if hasattr(message, 'file') else ".mp4")
-    print(f"⬇️ Downloading...")
     await client.download_media(message, raw_file, progress_callback=download_progress_callback)
     await client.disconnect()
 
-    # Get Metadata first to get the image prompt
-    metadata = await get_ai_metadata(message.file.name or raw_file)
-    
-    # Run image generation and video processing
-    thumb_task = generate_thumbnail(metadata.get('image_prompt', ''))
+    # Integrated OMDb + AI Metadata
+    metadata = await get_metadata(message.file.name or raw_file)
     final_video = process_video(raw_file)
+    thumb = generate_thumbnail_from_video(final_video)
     
-    thumb = await thumb_task
     upload_to_youtube(final_video, metadata, thumb)
 
-    # Final cleanup
-    for f in [raw_file, "processed_video.mp4", "thumbnail.png"]:
-        if os.path.exists(f): 
-            try: os.remove(f)
-            except: pass
+    for f in [raw_file, "processed_video.mp4", "thumbnail.jpg"]:
+        if os.path.exists(f): os.remove(f)
 
 if __name__ == '__main__':
     if len(sys.argv) > 1:
