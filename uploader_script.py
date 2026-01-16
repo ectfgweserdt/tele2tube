@@ -1,16 +1,9 @@
 import os
 import sys
-import argparse
-import time
 import asyncio
-import subprocess
-import json
-import base64
 import re
-import requests
-from telethon import TelegramClient, errors
+from telethon import TelegramClient
 from telethon.sessions import StringSession 
-from telethon.tl.types import MessageMediaDocument
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -19,92 +12,41 @@ import googleapiclient.errors
 
 # --- CONFIGURATION ---
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
-GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 
 # Fetching API Keys
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '').strip()
-OMDB_API_KEY = os.environ.get('OMDB_API_KEY', '').strip() 
-
-def run_command(command):
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-    output, error = process.communicate()
-    return output.decode(), error.decode(), process.returncode
+# Note: GEMINI and OMDB keys are no longer needed for simple mode
 
 def download_progress_callback(current, total):
-    print(f"⏳ Telegram Download: {current/1024/1024:.2f}MB / {total/1024/1024:.2f}MB ({current*100/total:.2f}%)", end='\r', flush=True)
+    # Simple progress indicator
+    if total:
+        print(f"⬇️ Download: {current/1024/1024:.2f}MB / {total/1024/1024:.2f}MB ({current*100/total:.1f}%)", end='\r')
 
-def parse_filename(filename):
-    """Extracts title, season, and episode for better IMDb searching."""
-    clean_name = os.path.splitext(filename)[0].replace('_', ' ').replace('.', ' ')
-    match = re.search(r'S(\d+)E(\d+)', clean_name, re.IGNORECASE)
-    season, episode = None, None
-    if match:
-        season = match.group(1)
-        episode = match.group(2)
-        search_title = clean_name[:match.start()].strip()
-    else:
-        tags = [r'\d{3,4}p', 'HD', 'NF', 'WEB-DL', 'Dual Audio', 'ES', 'x264', 'x265', 'HEVC']
-        search_title = clean_name
-        for tag in tags:
-            search_title = re.sub(tag, '', search_title, flags=re.IGNORECASE)
-        search_title = ' '.join(search_title.split()).strip()
-    return search_title, season, episode
+def get_simple_metadata(message, filename):
+    """
+    Extracts simple title from filename and description from the Telegram message caption.
+    """
+    # 1. Title from Filename
+    clean_name = os.path.splitext(filename)[0]
+    # Replace common separators with spaces and strip
+    title = clean_name.replace('_', ' ').replace('.', ' ').strip()
+    
+    # Ensure title isn't too long for YouTube (max 100 chars)
+    if len(title) > 95:
+        title = title[:95]
 
-async def get_metadata(filename):
-    search_title, season, episode = parse_filename(filename)
-    print(f"\n🔍 Searching IMDb for: {search_title} " + (f"(S{season}E{episode})" if season else ""))
-    omdb_data = None
-    if OMDB_API_KEY:
-        try:
-            url = f"http://www.omdbapi.com/?t={search_title}&apikey={OMDB_API_KEY}"
-            if season: url += f"&Season={season}&Episode={episode}"
-            res = requests.get(url, timeout=10)
-            data = res.json()
-            if data.get("Response") == "True":
-                print(f"✅ IMDb Match: {data['Title']}")
-                omdb_data = data
-        except: pass
+    # 2. Description from Message Caption
+    description = message.message if message.message else f"Uploaded from Telegram: {title}"
+    
+    # 3. Tags (Static)
+    tags = ["Telegram", "Video", "Upload"]
 
-    if GEMINI_API_KEY:
-        print("🤖 AI is formatting neat description...")
-        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-        prompt = (
-            f"Context: Filename is '{filename}'. IMDb Data: {json.dumps(omdb_data) if omdb_data else 'None found'}.\n\n"
-            "Task: Create NEAT YouTube metadata. Return JSON with keys: 'title', 'description', 'tags'.\n"
-            "1. TITLE: Formal (e.g. 'Show - S01E01 - Title')\n"
-            "2. DESCRIPTION: Sections with emojis (Synopsis, Cast, Details).\n"
-            "3. TAGS: 10 comma-separated keywords."
-        )
-        try:
-            payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}
-            res = requests.post(gemini_url, json=payload, timeout=30)
-            if res.status_code == 200:
-                return json.loads(res.json()['candidates'][0]['content']['parts'][0]['text'])
-        except: pass
-    return {"title": search_title, "description": "High quality upload.", "tags": "video"}
+    return {
+        "title": title,
+        "description": description,
+        "tags": tags
+    }
 
-def generate_thumbnail_from_video(video_path):
-    print("🖼️ Extracting thumbnail...")
-    output_thumb = "thumbnail.jpg"
-    try:
-        duration_cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 '{video_path}'"
-        duration_out, _, _ = run_command(duration_cmd)
-        seek_time = float(duration_out.strip()) / 4 if duration_out.strip() else 15
-        run_command(f"ffmpeg -ss {seek_time} -i '{video_path}' -vframes 1 -q:v 2 -y {output_thumb}")
-        return output_thumb if os.path.exists(output_thumb) else None
-    except: return None
-
-def process_video(input_path):
-    output_path = "processed_video.mp4"
-    print(f"🔍 Optimizing video & audio...")
-    cmd_ffmpeg = (
-        f"ffmpeg -i '{input_path}' -map 0:v:0 -map 0:a:m:language:eng? -map 0:a:0? "
-        f"-c:v copy -c:a aac -b:a 192k -y '{output_path}'"
-    )
-    _, _, code = run_command(cmd_ffmpeg)
-    return output_path if code == 0 and os.path.exists(output_path) else input_path
-
-def upload_to_youtube(video_path, metadata, thumb_path):
+def upload_to_youtube(video_path, metadata):
     try:
         creds = Credentials(
             token=None, refresh_token=os.environ.get('YOUTUBE_REFRESH_TOKEN'),
@@ -115,83 +57,153 @@ def upload_to_youtube(video_path, metadata, thumb_path):
         )
         creds.refresh(Request())
         youtube = build('youtube', 'v3', credentials=creds)
+        
         body = {
             'snippet': {
-                'title': metadata.get('title', 'Video')[:95],
-                'description': metadata.get('description', ''),
-                'tags': metadata.get('tags', '').split(','),
-                'categoryId': '24'
+                'title': metadata['title'],
+                'description': metadata['description'],
+                'tags': metadata['tags'],
+                'categoryId': '22' # 'People & Blogs' as a generic default
             },
             'status': {'privacyStatus': 'private'}
         }
+        
         print(f"🚀 Uploading: {body['snippet']['title']}")
-        media = MediaFileUpload(video_path, chunksize=1024*1024, resumable=True)
+        # Resumable upload allows for more stability with large files
+        media = MediaFileUpload(video_path, chunksize=1024*1024*2, resumable=True)
+        
         request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+        
         response = None
         while response is None:
             status, response = request.next_chunk()
-            if status: print(f"Uploaded {int(status.progress() * 100)}%")
+            if status:
+                print(f"⬆️ Upload: {int(status.progress() * 100)}%", end='\r')
         
-        if thumb_path:
-            # Shortened delay to reduce process time
-            time.sleep(5)
-            try: youtube.thumbnails().set(videoId=response['id'], media_body=MediaFileUpload(thumb_path)).execute()
-            except: pass
-        print(f"🎉 SUCCESS! https://youtu.be/{response['id']}")
+        print(f"\n🎉 SUCCESS! https://youtu.be/{response['id']}")
         return True
+
     except googleapiclient.errors.HttpError as e:
         error_details = e.content.decode()
-        # Handle both global quota and per-user daily limits
         if "uploadLimitExceeded" in error_details or "quotaExceeded" in error_details:
             print("\n❌ API LIMIT REACHED!")
-            print("YouTube allows ~6 uploads per day via API for free projects.")
-            print("The limit will reset in 24 hours.")
             return "LIMIT_REACHED"
-        print(f"🔴 YouTube Error: {e}")
+        print(f"\n🔴 YouTube HTTP Error: {e}")
         return False
     except Exception as e:
-        print(f"🔴 Error: {e}")
+        print(f"\n🔴 Error during upload: {e}")
         return False
+
+def parse_telegram_link(link):
+    """
+    Parses a Telegram link to extract chat entity and message ID.
+    Supports:
+    - Public: https://t.me/username/123
+    - Private: https://t.me/c/1234567890/123
+    """
+    link = link.strip()
+    # Remove query parameters (e.g., ?single)
+    if '?' in link:
+        link = link.split('?')[0]
+    
+    # Regex for Private Links (c/123456/789)
+    # Note: Telegram private link IDs usually need -100 prefix for Telethon
+    private_match = re.search(r't\.me/c/(\d+)/(\d+)', link)
+    if private_match:
+        chat_id_str = private_match.group(1)
+        msg_id = int(private_match.group(2))
+        chat_id = int(f"-100{chat_id_str}")
+        return chat_id, msg_id
+
+    # Regex for Public Links (username/789)
+    public_match = re.search(r't\.me/([^/]+)/(\d+)', link)
+    if public_match:
+        username = public_match.group(1)
+        msg_id = int(public_match.group(2))
+        return username, msg_id
+        
+    return None, None
 
 async def process_single_link(client, link):
     try:
         print(f"\n--- Processing: {link} ---")
-        parts = [p for p in link.strip('/').split('/') if p]
-        msg_id, chat_id = int(parts[-1]), int(f"-100{parts[parts.index('c')+1]}")
-    except: return True
+        
+        chat_id, msg_id = parse_telegram_link(link)
+        
+        if not chat_id or not msg_id:
+            print(f"❌ Invalid Link Format: {link}")
+            return True
 
-    message = await client.get_messages(chat_id, ids=msg_id)
-    if not message or not message.media: return True
+        # Fetch Message
+        try:
+            message = await client.get_messages(chat_id, ids=msg_id)
+        except ValueError:
+            # Sometimes private channels need to be accessed differently if not in cache
+            # But the user account must be joined to the channel
+            print(f"❌ Cannot access chat. Ensure the account is a member of: {chat_id}")
+            return True
+        except Exception as e:
+            print(f"❌ Error fetching message: {e}")
+            return True
+        
+        if not message or not message.media:
+            print("❌ No media found in message.")
+            return True
 
-    raw_file = f"download_{msg_id}" + (message.file.ext if hasattr(message, 'file') else ".mp4")
-    print(f"⬇️ Downloading...")
-    await client.download_media(message, raw_file, progress_callback=download_progress_callback)
-    
-    metadata = await get_metadata(message.file.name or raw_file)
-    final_video = process_video(raw_file)
-    thumb = generate_thumbnail_from_video(final_video)
-    
-    status = upload_to_youtube(final_video, metadata, thumb)
+        # Determine filename
+        if hasattr(message.file, 'name') and message.file.name:
+            original_filename = message.file.name
+        else:
+            ext = message.file.ext if hasattr(message, 'file') else ".mp4"
+            original_filename = f"video_{msg_id}{ext}"
 
-    for f in [raw_file, "processed_video.mp4", "thumbnail.jpg"]:
-        if os.path.exists(f): os.remove(f)
-    return status
+        raw_file = f"download_{msg_id}_{original_filename}"
+        
+        # SAFETY CHECK: Remove file if it exists
+        if os.path.exists(raw_file):
+            os.remove(raw_file)
+
+        print(f"⬇️ Downloading: {original_filename}")
+        await client.download_media(message, raw_file, progress_callback=download_progress_callback)
+        print("\n✅ Download Complete.")
+        
+        # Get Metadata
+        metadata = get_simple_metadata(message, original_filename)
+        
+        # Upload
+        status = upload_to_youtube(raw_file, metadata)
+
+        # Cleanup
+        if os.path.exists(raw_file):
+            os.remove(raw_file)
+            
+        return status
+
+    except Exception as e:
+        print(f"🔴 Critical Error processing link {link}: {e}")
+        return False
 
 async def run_flow(links_str):
     links = [l.strip() for l in links_str.split(',') if l.strip()]
-    client = TelegramClient(
-        StringSession(os.environ['TG_SESSION_STRING']), 
-        os.environ['TG_API_ID'], 
-        os.environ['TG_API_HASH'],
-        connection_retries=None,
-        retry_delay=5
-    )
-    await client.start()
-    for link in links:
-        result = await process_single_link(client, link)
-        if result == "LIMIT_REACHED":
-            break
-    await client.disconnect()
+    
+    try:
+        client = TelegramClient(
+            StringSession(os.environ['TG_SESSION_STRING']), 
+            int(os.environ['TG_API_ID']), 
+            os.environ['TG_API_HASH'],
+            connection_retries=None,
+            retry_delay=5
+        )
+        await client.start()
+        
+        for link in links:
+            result = await process_single_link(client, link)
+            if result == "LIMIT_REACHED":
+                break
+                
+        await client.disconnect()
+    except Exception as e:
+        print(f"🔴 Client Error: {e}")
 
 if __name__ == '__main__':
     if len(sys.argv) > 1:
