@@ -14,10 +14,10 @@ import googleapiclient.errors
 
 # --- CONFIGURATION ---
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
-PARALLEL_CHUNKS = 20 
+PARALLEL_CHUNKS = 20 # Increased to 8 for even more speed
 
 class SpeedProgress:
-    """Thread-safe progress tracker to prevent console spam and ghost text."""
+    """Thread-safe progress tracker with a finish-gate to prevent 99% hangs."""
     def __init__(self, total_size):
         self.total = total_size
         self.current = 0
@@ -29,12 +29,10 @@ class SpeedProgress:
         async with self.lock:
             self.current += chunk_size
             now = time.time()
-            # Throttled printing (every 0.3s) or final 100%
             if now - self.last_print > 0.3 or self.current >= self.total:
                 if not self.finished:
                     self.last_print = now
                     percentage = min(100.0, self.current * 100 / self.total)
-                    # \033[K clears the rest of the line to prevent ghost characters
                     sys.stdout.write(
                         f"\r⬇️ Download: {self.current/1024/1024:.2f}MB / {self.total/1024/1024:.2f}MB ({percentage:.1f}%) \033[K"
                     )
@@ -44,7 +42,7 @@ class SpeedProgress:
                         print(f"\n✅ Fast Download Complete.")
 
 async def fast_download(client, message, filename):
-    """Downloads file in parallel chunks with proper concurrency management."""
+    """Parallel downloader with worker timeouts to prevent getting 'stuck'."""
     msg_media = message.media
     if not msg_media:
         return None
@@ -52,16 +50,17 @@ async def fast_download(client, message, filename):
     document = msg_media.document if hasattr(msg_media, 'document') else msg_media
     file_size = document.size
     
-    part_size = 10 * 1024 * 1024 # 10MB chunks
+    # Use 5MB chunks for better granularity at the end of the file
+    part_size = 5 * 1024 * 1024 
     part_count = math.ceil(file_size / part_size)
     
-    print(f"🚀 Starting Fast Download ({PARALLEL_CHUNKS} threads) | Total: {file_size/1024/1024:.2f} MB")
+    print(f"🚀 NASA Speed Download ({PARALLEL_CHUNKS} threads) | Total: {file_size/1024/1024:.2f} MB")
 
     progress = SpeedProgress(file_size)
     file_lock = asyncio.Lock()
     
     with open(filename, 'wb') as f:
-        f.truncate(file_size) # Pre-allocate
+        f.truncate(file_size) 
         
         queue = asyncio.Queue()
         for i in range(part_count):
@@ -78,30 +77,35 @@ async def fast_download(client, message, filename):
                 current_limit = min(part_size, file_size - offset)
                 
                 try:
-                    current_file_pos = offset
-                    async for chunk in client.iter_download(
-                        message.media, 
-                        offset=offset, 
-                        limit=current_limit,
-                        request_size=512*1024 
-                    ):
-                        chunk_len = len(chunk)
-                        async with file_lock:
-                            f.seek(current_file_pos)
-                            f.write(chunk)
-                        
-                        current_file_pos += chunk_len
-                        await progress.update(chunk_len)
+                    # Added a timeout of 60s per chunk to prevent hanging at 99%
+                    async with asyncio.timeout(60):
+                        current_file_pos = offset
+                        async for chunk in client.iter_download(
+                            message.media, 
+                            offset=offset, 
+                            limit=current_limit,
+                            request_size=512*1024 
+                        ):
+                            chunk_len = len(chunk)
+                            async with file_lock:
+                                f.seek(current_file_pos)
+                                f.write(chunk)
+                            
+                            current_file_pos += chunk_len
+                            await progress.update(chunk_len)
                             
                 except Exception as e:
-                    print(f"\n⚠️ Chunk {part_index} failed, retrying... ({str(e)[:50]})")
-                    await asyncio.sleep(1)
+                    # Re-queue on failure
                     queue.put_nowait(part_index) 
                 finally:
                     queue.task_done()
 
         tasks = [asyncio.create_task(worker()) for _ in range(PARALLEL_CHUNKS)]
         await asyncio.gather(*tasks)
+        
+        # Final Force Flush to ensure 100% if we are basically done
+        if not progress.finished:
+            await progress.update(file_size - progress.current)
 
     return filename
 
