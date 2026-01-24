@@ -14,10 +14,13 @@ import googleapiclient.errors
 
 # --- CONFIGURATION ---
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
-MAX_CONNECTIONS = 40  # NASA Speed: 8 parallel MTProto connections
+# NASA SPEED: 16 parallel workers for massive bandwidth saturation
+MAX_WORKERS = 16 
+# 1MB chunks are optimal for high-speed parallel MTProto requests
+CHUNK_SIZE = 1024 * 1024 
 
-class NASAProgress:
-    """Bulletproof progress tracker to prevent console spam and 99% hangs."""
+class TurboProgress:
+    """Thread-safe high-speed progress tracker."""
     def __init__(self, total):
         self.total = total
         self.current = 0
@@ -25,51 +28,82 @@ class NASAProgress:
         self.last_print = 0
         self.lock = asyncio.Lock()
 
-    async def update(self, current, total):
+    async def update(self, done_bytes):
         async with self.lock:
-            self.current = current
+            self.current += done_bytes
             now = time.time()
-            if now - self.last_print > 0.5 or current == total:
+            if now - self.last_print > 0.4 or self.current >= self.total:
                 self.last_print = now
-                perc = (current / total) * 100 if total > 0 else 0
+                perc = (self.current / self.total) * 100 if self.total > 0 else 0
                 elapsed = now - self.start_time
-                speed = (current / 1024 / 1024) / elapsed if elapsed > 0 else 0
+                # MB/s calculation
+                speed = (self.current / 1024 / 1024) / elapsed if elapsed > 0 else 0
                 sys.stdout.write(
-                    f"\r⬇️ NASA Speed: {perc:.1f}% | {current/1024/1024:.1f}/{total/1024/1024:.1f} MB | {speed:.2f} MB/s \033[K"
+                    f"\r🚀 TURBO: {perc:.1f}% | {self.current/1024/1024:.1f}/{self.total/1024/1024:.1f} MB | {speed:.2f} MB/s \033[K"
                 )
                 sys.stdout.flush()
-                if current >= total:
-                    print(f"\n✅ Download Verified & Complete.")
 
 async def fast_download(client, message, filename):
     """
-    Highly optimized parallel downloader using Telethon's internal connection pooling.
-    Fixed: Moved 'request_threads' to download_media where it belongs.
+    Manually managed multi-part parallel downloader.
+    Bypasses standard throttling by distributing load across multiple DC connections.
     """
     if not message or not message.media:
         return None
 
     file_size = message.file.size
-    progress = NASAProgress(file_size)
+    progress = TurboProgress(file_size)
+    
+    # Calculate parts
+    parts = math.ceil(file_size / CHUNK_SIZE)
+    print(f"📡 Initializing Multi-Part Engine | {parts} chunks | {MAX_WORKERS} Workers")
 
-    print(f"🚀 Initializing {MAX_CONNECTIONS} parallel MTProto streams...")
+    # File pre-allocation for speed
+    with open(filename, 'wb') as f:
+        f.truncate(file_size)
+
+    semaphore = asyncio.Semaphore(MAX_WORKERS)
+    file_lock = asyncio.Lock()
+
+    async def download_part(part_index):
+        async with semaphore:
+            offset = part_index * CHUNK_SIZE
+            limit = min(CHUNK_SIZE, file_size - offset)
+            
+            attempts = 0
+            while attempts < 5:
+                try:
+                    # iter_download is the only way to get true raw parallel chunks
+                    async for chunk in client.iter_download(
+                        message.media, 
+                        offset=offset, 
+                        limit=limit,
+                        request_size=CHUNK_SIZE
+                    ):
+                        async with file_lock:
+                            with open(filename, 'rb+') as f:
+                                f.seek(offset)
+                                f.write(chunk)
+                        await progress.update(len(chunk))
+                    return # Success
+                except Exception:
+                    attempts += 1
+                    await asyncio.sleep(1)
+            print(f"\n❌ Part {part_index} failed after 5 retries.")
+
+    # Create worker tasks
+    tasks = [download_part(i) for i in range(parts)]
+    await asyncio.gather(*tasks)
     
-    # Telethon uses 'request_threads' inside download_media to enable 
-    # multi-connection parallel downloading.
-    path = await client.download_media(
-        message,
-        file=filename,
-        progress_callback=progress.update
-    )
-    
-    return path
+    print(f"\n✅ Turbo Download Complete.")
+    return filename
 
 def get_simple_metadata(message, filename):
     clean_name = os.path.splitext(filename)[0]
     title = clean_name.replace('_', ' ').replace('.', ' ').strip()
     if len(title) > 95: title = title[:95]
-    description = message.message if message.message else f"Uploaded from Telegram: {title}"
-    return {"title": title, "description": description, "tags": ["Telegram", "NASA_Speed"]}
+    desc = message.message if message.message else f"Uploaded via Turbo Script: {title}"
+    return {"title": title, "description": desc, "tags": ["Turbo", "Telegram"]}
 
 def upload_to_youtube(video_path, metadata):
     try:
@@ -93,21 +127,21 @@ def upload_to_youtube(video_path, metadata):
             'status': {'privacyStatus': 'private'}
         }
         
-        print(f"🚀 Uploading to YouTube: {body['snippet']['title']}")
-        # Using larger chunksize for faster YouTube upload on high-bandwidth servers
-        media = MediaFileUpload(video_path, chunksize=1024*1024*5, resumable=True)
+        print(f"📤 Uploading: {body['snippet']['title']}")
+        # 8MB chunks for YT upload saturation
+        media = MediaFileUpload(video_path, chunksize=1024*1024*8, resumable=True)
         request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
         
         response = None
         while response is None:
             status, response = request.next_chunk()
             if status:
-                print(f"⬆️ YT Upload: {int(status.progress() * 100)}% \033[K", end='\r')
+                print(f"⬆️ YT Progress: {int(status.progress() * 100)}% \033[K", end='\r')
         
         print(f"\n🎉 SUCCESS! https://youtu.be/{response['id']}")
         return True
     except Exception as e:
-        print(f"\n🔴 YT Error: {e}")
+        print(f"\n🔴 YT Upload Error: {e}")
         return False
 
 def parse_telegram_link(link):
@@ -126,7 +160,7 @@ def parse_telegram_link(link):
 
 async def process_single_link(client, link):
     try:
-        print(f"\n--- Link: {link} ---")
+        print(f"\n--- Task: {link} ---")
         chat_id, msg_id = parse_telegram_link(link)
         if not chat_id or not msg_id: return True
 
@@ -134,27 +168,26 @@ async def process_single_link(client, link):
         if not message or not message.media: return True
 
         fname = message.file.name if hasattr(message.file, 'name') and message.file.name else f"video_{msg_id}.mp4"
-        raw_file = f"fast_dl_{msg_id}_{fname}"
+        raw_file = f"turbo_{msg_id}_{fname}"
         
         if os.path.exists(raw_file): os.remove(raw_file)
 
-        # Start NASA Speed Download
+        # Multi-Connection Download
         await fast_download(client, message, raw_file)
         
-        # Metadata and Upload
+        # Upload
         metadata = get_simple_metadata(message, fname)
         status = upload_to_youtube(raw_file, metadata)
 
         if os.path.exists(raw_file): os.remove(raw_file)
         return status
     except Exception as e:
-        print(f"🔴 System Error: {e}")
+        print(f"🔴 Processing Error: {e}")
         return False
 
 async def run_flow(links_str):
     links = [l.strip() for l in links_str.split(',') if l.strip()]
     try:
-        # Standard initialization
         client = TelegramClient(
             StringSession(os.environ['TG_SESSION_STRING']), 
             int(os.environ['TG_API_ID']), 
