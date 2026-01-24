@@ -3,6 +3,7 @@ import sys
 import asyncio
 import re
 import math
+import time
 from telethon import TelegramClient, utils
 from telethon.sessions import StringSession 
 from google.auth.transport.requests import Request
@@ -15,16 +16,22 @@ import googleapiclient.errors
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
 PARALLEL_CHUNKS = 4  # Number of parallel downloads.
 
+# Global to track last print time to prevent spam
+last_print_time = 0
+
 def download_progress_callback(current, total):
-    if total:
-        # Clamp progress to 100% to avoid confusing logs
+    global last_print_time
+    now = time.time()
+    
+    # Only print if 0.5 seconds passed OR it's the final byte (100%)
+    if total and (now - last_print_time > 0.5 or current == total):
+        last_print_time = now
         percentage = min(100.0, current * 100 / total)
         print(f"⬇️ Download: {current/1024/1024:.2f}MB / {total/1024/1024:.2f}MB ({percentage:.1f}%)", end='\r')
 
 async def fast_download(client, message, filename, progress_callback=None):
     """
-    Downloads a file in parallel chunks. Fixes the progress overflow issue 
-    by ensuring the counter is updated accurately and capped at total size.
+    Downloads a file in parallel chunks with NASA-tier speed and no console spam.
     """
     msg_media = message.media
     if not msg_media:
@@ -33,17 +40,16 @@ async def fast_download(client, message, filename, progress_callback=None):
     document = msg_media.document if hasattr(msg_media, 'document') else msg_media
     file_size = document.size
     
-    part_size = 10 * 1024 * 1024 # 10MB
+    part_size = 10 * 1024 * 1024 # 10MB chunks
     part_count = math.ceil(file_size / part_size)
     
-    print(f"🚀 Starting Parallel Download ({PARALLEL_CHUNKS} threads) for {file_size/1024/1024:.2f} MB...")
+    print(f"🚀 Starting Fast Download ({PARALLEL_CHUNKS} threads) for {file_size/1024/1024:.2f} MB...")
 
     file_lock = asyncio.Lock()
-    progress_lock = asyncio.Lock() # Added lock for progress counter
+    progress_lock = asyncio.Lock()
     downloaded_bytes = 0
     
     with open(filename, 'wb') as f:
-        # Pre-allocate file size
         f.truncate(file_size)
         
         queue = asyncio.Queue()
@@ -71,22 +77,19 @@ async def fast_download(client, message, filename, progress_callback=None):
                     ):
                         chunk_len = len(chunk)
                         
-                        # Write to file at specific position
                         async with file_lock:
                             f.seek(current_file_pos)
                             f.write(chunk)
                         
                         current_file_pos += chunk_len
                         
-                        # Update progress safely
                         async with progress_lock:
                             downloaded_bytes += chunk_len
                             if progress_callback:
-                                # Ensure we don't report more than the actual file size
                                 progress_callback(min(downloaded_bytes, file_size), file_size)
                             
                 except Exception as e:
-                    print(f"⚠️ Chunk {part_index} failed, retrying... ({e})")
+                    print(f"⚠️ Chunk {part_index} failed, retrying...")
                     queue.put_nowait(part_index) 
                 finally:
                     queue.task_done()
@@ -128,7 +131,7 @@ def upload_to_youtube(video_path, metadata):
             'status': {'privacyStatus': 'private'}
         }
         
-        print(f"🚀 Uploading: {body['snippet']['title']}")
+        print(f"🚀 Uploading to YT: {body['snippet']['title']}")
         media = MediaFileUpload(video_path, chunksize=1024*1024*2, resumable=True)
         request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
         
@@ -144,12 +147,12 @@ def upload_to_youtube(video_path, metadata):
     except googleapiclient.errors.HttpError as e:
         error_details = e.content.decode()
         if "uploadLimitExceeded" in error_details or "quotaExceeded" in error_details:
-            print("\n❌ API LIMIT REACHED!")
+            print("\n❌ YOUTUBE QUOTA EXCEEDED!")
             return "LIMIT_REACHED"
-        print(f"\n🔴 YouTube HTTP Error: {e}")
+        print(f"\n🔴 YT HTTP Error: {e}")
         return False
     except Exception as e:
-        print(f"\n🔴 Error during upload: {e}")
+        print(f"\n🔴 Upload Error: {e}")
         return False
 
 def parse_telegram_link(link):
