@@ -55,11 +55,13 @@ class FastDownloader:
                     with open(part_name, "rb") as pf:
                         final_file.write(pf.read())
                     os.remove(part_name)
-        print(f"✅ File Saved: {self.file_path}")
+        print(f"✅ File Saved Locally: {self.file_path}")
 
 def get_lecture_title(filename):
     name = os.path.splitext(filename)[0]
-    return name.replace("_", " ").replace(".", " ").title()
+    # Clean up common characters
+    title = name.replace("_", " ").replace(".", " ").replace("-", " ")
+    return title.title()
 
 def upload_to_youtube(file_path, title):
     try:
@@ -72,56 +74,65 @@ def upload_to_youtube(file_path, title):
         )
         youtube = build("youtube", "v3", credentials=creds)
         body = {
-            "snippet": {"title": title[:100], "description": f"Class Lecture: {title}", "categoryId": "27"},
+            "snippet": {
+                "title": title[:100], 
+                "description": f"Class Lecture: {title}\nAutomated Archive.", 
+                "categoryId": "27"
+            },
             "status": {"privacyStatus": "private"}
         }
         media = MediaFileUpload(file_path, chunksize=1024*1024*5, resumable=True)
         request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
         
-        print(f"📤 YouTube Upload: {title}...")
+        print(f"📤 Starting YouTube Upload: {title}")
         response = None
         while response is None:
             status, response = request.next_chunk()
             if status:
-                print(f"📈 Progress: {int(status.progress() * 100)}%")
+                print(f"📈 YouTube Progress: {int(status.progress() * 100)}%")
         print(f"🎉 YouTube ID: {response['id']}")
     except Exception as e:
-        print(f"❌ YouTube Error: {e}")
+        print(f"❌ YouTube Upload Error: {e}")
 
 async def process_link(client, link):
     try:
-        print(f"\n🔗 Processing Link: {link}")
+        print(f"\n🔗 Analyzing Link: {link}")
         parts = [p for p in link.strip('/').split('/') if p]
         
-        # Fixed logic for nested links like /c/ID/TOPIC/MSG_ID
+        # Link Format Handling (t.me/c/CHANNEL_ID/TOPIC_ID/MSG_ID)
         msg_id = int(parts[-1])
         if 'c' in parts:
             c_idx = parts.index('c')
+            # The channel ID is immediately after 'c'
             chat_id = int(f"-100{parts[c_idx + 1]}")
         else:
+            # Public links t.me/CHANNEL_NAME/MSG_ID
             chat_id = parts[-2]
 
-        print(f"📡 Fetching Chat: {chat_id} | Msg: {msg_id}")
+        print(f"📡 Fetching from Chat: {chat_id}, Message: {msg_id}")
         message = await client.get_messages(chat_id, ids=msg_id)
         
         if not message or not message.file:
-            print("❌ No video file found in this message.")
+            print("❌ No video file found in this message. Check if you have access to this chat.")
             return
 
         filename = message.file.name or f"lecture_{msg_id}.mp4"
         title = get_lecture_title(filename)
         
+        print(f"📂 File identified: {filename}")
         downloader = FastDownloader(client, message, filename)
         await downloader.download()
+        
         upload_to_youtube(filename, title)
         
         if os.path.exists(filename):
             os.remove(filename)
             
     except Exception as e:
-        print(f"❌ Process Error: {e}")
+        print(f"❌ Critical Error in process_link: {e}")
 
 async def main():
+    print("🚀 Script Initialization...")
     if len(sys.argv) < 2:
         print("❌ Error: No links provided as arguments.")
         return
@@ -133,30 +144,30 @@ async def main():
     session_str = os.environ.get('TG_SESSION_STRING', '').strip()
 
     if not session_str:
-        print("❌ Error: TG_SESSION_STRING env variable is empty.")
+        print("❌ Error: TG_SESSION_STRING is missing from GitHub Secrets or Environment Variables.")
         return
 
-    print("🛰 Connecting to Telegram...")
+    print("🛰 Connecting to Telegram via User Session...")
     client = TelegramClient(StringSession(session_str), api_id, api_hash)
     
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            print("❌ Auth Failed: Session string is invalid.")
+            print("❌ Authentication Failed: The TG_SESSION_STRING is invalid or has expired.")
             return
             
         me = await client.get_me()
-        print(f"✅ Logged in as: {me.first_name}")
+        print(f"✅ Logged in as: {me.first_name} (@{me.username})")
 
         for link in links:
             if link.strip():
                 await process_link(client, link.strip())
                 
     except Exception as e:
-        print(f"❌ Main Loop Error: {e}")
+        print(f"❌ Main Execution Loop Error: {e}")
     finally:
         await client.disconnect()
-        print("🔌 Disconnected.")
+        print("🔌 Disconnected from Telegram.")
 
 if __name__ == "__main__":
     asyncio.run(main())
