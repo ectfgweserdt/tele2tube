@@ -1,14 +1,14 @@
-name: Run Telegram to YouTube Uploader
+name: Fast Telegram to YouTube Bot
 
 on:
   workflow_dispatch:
     inputs:
       telegram_link:
-        description: 'Single link or multiple links separated by commas'
+        description: 'Telegram Links (Comma separated)'
         required: true
         type: string
 
-# Ensure only one upload runs at a time
+# Ensure only one upload runs at a time to prevent IP conflicts
 concurrency: 
   group: telegram-upload
   cancel-in-progress: false 
@@ -16,29 +16,25 @@ concurrency:
 jobs:
   upload:
     runs-on: ubuntu-latest
-    
-    env:
-      TG_API_ID: ${{ secrets.TG_API_ID }}
-      TG_API_HASH: ${{ secrets.TG_API_HASH }}
-      TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
-      YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-      YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-      YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-      # No longer needing GEMINI or OMDB keys
-
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-
-      # Removed FFmpeg installation for speed (raw upload)
-
-      - name: Install Python Dependencies
-        run: pip install -r requirements.txt
-        
-      - name: Run Uploader Script
+          python-version: '3.11'
+      - name: Install Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+      - name: Install High-Speed Libraries
+        run: pip install --no-cache-dir -r requirements.txt
+      - name: Execute
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
         run: python uploader_script.py "${{ github.event.inputs.telegram_link }}"
