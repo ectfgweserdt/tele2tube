@@ -14,8 +14,8 @@ import googleapiclient.errors
 
 # --- CONFIGURATION ---
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
-# NASA Speed: 12 parallel connections
-MAX_WORKERS = 12 
+# NASA Speed: 10 parallel workers is safer to avoid chunk failures
+MAX_WORKERS = 10 
 # 1MB is the maximum Telegram chunk size
 CHUNK_SIZE = 1024 * 1024 
 
@@ -43,7 +43,7 @@ class TurboProgress:
                 sys.stdout.flush()
 
 async def fast_download(client, message, filename):
-    """Strict multi-part downloader using task queue."""
+    """Multi-part downloader with auto-retry and backoff for failed chunks."""
     if not message or not message.media:
         return None
 
@@ -61,6 +61,8 @@ async def fast_download(client, message, filename):
         queue.put_nowait(i)
 
     file_lock = asyncio.Lock()
+    # Limit active requests to prevent socket saturation
+    network_semaphore = asyncio.Semaphore(MAX_WORKERS)
 
     async def worker():
         while not queue.empty():
@@ -73,13 +75,16 @@ async def fast_download(client, message, filename):
             limit = min(CHUNK_SIZE, file_size - offset)
             
             success = False
-            for attempt in range(5):
+            # Increased retries to 10 with backoff
+            for attempt in range(10):
                 try:
-                    chunk_data = await client.download_item_any(
-                        message.media,
-                        offset=offset,
-                        limit=limit
-                    )
+                    async with network_semaphore:
+                        chunk_data = await client.download_item_any(
+                            message.media,
+                            offset=offset,
+                            limit=limit
+                        )
+                    
                     if chunk_data:
                         async with file_lock:
                             with open(filename, 'rb+') as f:
@@ -88,11 +93,16 @@ async def fast_download(client, message, filename):
                         await progress.update(len(chunk_data))
                         success = True
                         break
+                    else:
+                        raise Exception("Empty chunk received")
                 except Exception:
-                    await asyncio.sleep(1)
+                    # Exponential-ish backoff to let the connection breathe
+                    wait_time = 1 + (attempt * 1.5)
+                    await asyncio.sleep(wait_time)
             
             if not success:
-                print(f"\n❌ Failed chunk {chunk_index}")
+                print(f"\n❌ CRITICAL: Failed chunk {chunk_index} after 10 attempts.")
+            
             queue.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(MAX_WORKERS)]
@@ -129,7 +139,7 @@ def upload_to_youtube(video_path, metadata):
             'status': {'privacyStatus': 'private'}
         }
         
-        print(f"📤 Uploading to YT: {body['snippet']['title']}")
+        print(f"📤 Uploading: {body['snippet']['title']}")
         media = MediaFileUpload(video_path, chunksize=1024*1024*8, resumable=True)
         request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
         
@@ -146,48 +156,27 @@ def upload_to_youtube(video_path, metadata):
         return False
 
 def parse_telegram_link(link):
-    """Enhanced parser for private channel links like /c/12345/184/215"""
     link = link.strip()
     if '?' in link: link = link.split('?')[0]
-    
-    # Check for private channel format /c/ID/MSG_ID
     if 't.me/c/' in link:
         try:
             parts = link.split('t.me/c/')[1].split('/')
-            # Filter out empty strings and get only digits
             nums = [p for p in parts if p.isdigit()]
             if len(nums) >= 2:
-                # Private channel IDs usually start with -100
-                chat_id = int(f"-100{nums[0]}")
-                # The message ID is ALWAYS the last number in the URL
-                msg_id = int(nums[-1])
-                return chat_id, msg_id
+                return int(f"-100{nums[0]}"), int(nums[-1])
         except: pass
-        
-    # Public link fallback
     m = re.search(r't\.me/([^/]+)/(\d+)', link)
     if m: return m.group(1), int(m.group(2))
-    
     return None, None
 
 async def process_single_link(client, link):
     try:
         print(f"\n🔍 Parsing Link: {link}")
         chat_id, msg_id = parse_telegram_link(link)
-        
-        if not chat_id or not msg_id:
-            print(f"❌ Could not parse Chat ID or Message ID from: {link}")
-            return True
+        if not chat_id or not msg_id: return True
 
-        print(f"✅ Target Found: Chat {chat_id}, Msg {msg_id}")
         message = await client.get_messages(chat_id, ids=msg_id)
-        
-        if not message:
-            print("❌ Message not found. Check if the bot/session has access to this channel.")
-            return True
-        if not message.media:
-            print("❌ Message has no media content.")
-            return True
+        if not message or not message.media: return True
 
         fname = message.file.name if hasattr(message.file, 'name') and message.file.name else f"video_{msg_id}.mp4"
         raw_file = f"turbo_{msg_id}_{fname}"
