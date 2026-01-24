@@ -14,7 +14,7 @@ import googleapiclient.errors
 
 # --- CONFIGURATION ---
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
-MAX_CONNECTIONS = 200  # NASA Speed: 8 parallel MTProto connections
+MAX_CONNECTIONS = 20000  # NASA Speed: 8 parallel MTProto connections
 
 class NASAProgress:
     """Bulletproof progress tracker to prevent console spam and 99% hangs."""
