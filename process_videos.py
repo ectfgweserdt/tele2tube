@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import time
+import re
 from google import genai
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -33,48 +34,79 @@ def get_youtube_service():
     )
     return build('youtube', 'v3', credentials=creds)
 
+def get_or_create_playlist(youtube, title):
+    """Finds a playlist by title or creates it."""
+    try:
+        request = youtube.playlists().list(part="snippet", mine=True, maxResults=50)
+        response = request.execute()
+        
+        for item in response.get('items', []):
+            if item['snippet']['title'].lower() == title.lower():
+                return item['id']
+
+        print(f"Creating new playlist: {title}")
+        request = youtube.playlists().insert(
+            part="snippet,status",
+            body={
+                "snippet": {"title": title, "description": f"Auto-categorized playlist for {title}"},
+                "status": {"privacyStatus": "private"}
+            }
+        )
+        response = request.execute()
+        return response['id']
+    except Exception as e:
+        print(f"Playlist error: {e}")
+        return None
+
 async def analyze_content_with_retry(text_content):
-    """Uses Gemini API with backoff and model fallbacks."""
+    """Uses Gemini API with translation capabilities and retries."""
     if not text_content:
-        text_content = "No description provided. Analyze the context of a generic tuition class."
+        text_content = "Untitled Tuition Video"
     
     client = genai.Client(api_key=GEMINI_API_KEY)
+    
+    # Improved prompt for Sinhala translation and categorization
     prompt = f"""
-    You are an intelligent assistant organizing tuition videos.
-    Analyze this text: "{text_content}"
-    Return ONLY a JSON object with keys: "title", "description", "category".
+    You are a classroom assistant. Analyze this Telegram message text: "{text_content}"
+    
+    Task:
+    1. Translate Sinhala terms to English (e.g., 'තාපය' -> 'Heat', 'යාන්ත්‍ර විද්‍යාව' -> 'Mechanics').
+    2. Create a professional YouTube Video Title.
+    3. Categorize it into a broad Unit/Subject (e.g., Heat, Mechanics, Calculus, Waves). This will be used as a playlist name.
+    
+    Output MUST be a valid JSON object:
+    {{"title": "English Title", "description": "Original text and summary", "category": "Unit Name"}}
     """
     
-    # Try these models in order
     models_to_try = ['gemini-2.0-flash', 'gemini-1.5-flash']
     
     for model_name in models_to_try:
-        retries = 3
-        for i in range(retries):
+        for i in range(5): # Exponential backoff retries
             try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt
-                )
-                clean_json = response.text.replace('```json', '').replace('```', '').strip()
-                return json.loads(clean_json)
+                response = client.models.generate_content(model=model_name, contents=prompt)
+                # Extract JSON from potential markdown markers
+                raw_text = response.text
+                match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+                if match:
+                    return json.loads(match.group())
+                return json.loads(raw_text)
             except Exception as e:
-                # If it's a 404, stop retrying this model and move to the next one
-                if "404" in str(e):
-                    break 
-                if i < retries - 1:
-                    await asyncio.sleep(2 ** i)
-                    continue
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                    wait = (i + 1) * 10 
+                    print(f"Quota hit. Waiting {wait}s...")
+                    await asyncio.sleep(wait)
+                else:
+                    break
     
-    # Final Fallback if all AI attempts fail
+    # Enhanced local fallback if AI fails completely
+    clean_title = text_content.replace('*', '').strip()
     return {
-        "title": f"Class Video - {time.strftime('%Y-%m-%d')}", 
-        "description": f"Original text: {text_content}", 
+        "title": clean_title if clean_title else f"Video {time.strftime('%Y-%m-%d')}", 
+        "description": f"Original caption: {text_content}", 
         "category": "General Tuition"
     }
 
 def progress_callback(current, total):
-    # Only print every 5% to keep the GitHub log clean and fast
     percent = (current * 100 / total)
     if int(percent) % 5 == 0:
         print(f"\rDownloading: {percent:.1f}%", end="", flush=True)
@@ -100,6 +132,7 @@ async def parse_telegram_link(client, link):
 
 async def main():
     if not VIDEO_LINKS or not VIDEO_LINKS[0]:
+        print("No links found.")
         return
 
     print("Connecting to Telegram...")
@@ -122,18 +155,24 @@ async def main():
             message = await client.get_messages(entity, ids=msg_id)
 
             if not message or not message.media:
+                print("No media found.")
                 continue
 
             print("Analyzing with AI...")
             metadata = await analyze_content_with_retry(message.text or message.caption)
+            print(f"Result: {metadata['title']} [{metadata['category']}]")
             
             print("Downloading...")
             if not os.path.exists("downloads"): os.makedirs("downloads")
             file_path = await client.download_media(message, file="downloads/", progress_callback=progress_callback)
             
-            print(f"\nUploading to YouTube: {metadata['title']}")
+            print(f"\nUploading to YouTube...")
             body = {
-                'snippet': {'title': metadata['title'], 'description': metadata['description'], 'categoryId': '27'},
+                'snippet': {
+                    'title': metadata['title'], 
+                    'description': metadata['description'], 
+                    'categoryId': '27'
+                },
                 'status': {'privacyStatus': 'private'}
             }
 
@@ -144,13 +183,29 @@ async def main():
             while response is None:
                 status, response = upload_request.next_chunk()
                 if status:
-                    print(f"\rUpload: {int(status.progress() * 100)}%", end="", flush=True)
+                    print(f"\rUpload Progress: {int(status.progress() * 100)}%", end="", flush=True)
 
-            print(f"\nSuccess! ID: {response.get('id')}")
+            video_id = response.get('id')
+            print(f"\nSuccess! Video ID: {video_id}")
+
+            # Playlist Management
+            playlist_id = get_or_create_playlist(youtube, metadata['category'])
+            if playlist_id:
+                youtube.playlistItems().insert(
+                    part="snippet",
+                    body={
+                        "snippet": {
+                            "playlistId": playlist_id,
+                            "resourceId": {"kind": "youtube#video", "videoId": video_id}
+                        }
+                    }
+                ).execute()
+                print(f"Added to playlist: {metadata['category']}")
+
             if os.path.exists(file_path): os.remove(file_path)
 
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error processing link: {e}")
 
     await client.disconnect()
 
